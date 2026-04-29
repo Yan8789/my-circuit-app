@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import JSZip from 'jszip';
-import { Stage, Layer, Image as KonvaImage, Group, Circle, Rect, Line, Text } from 'react-konva';
+import { Stage, Layer, Image as KonvaImage, Group, Circle, Rect, Line, Text, Path } from 'react-konva';
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, setDoc, getDoc } from "firebase/firestore";
+import { font5x8 } from './lcdFont.js';
 
 const firebaseConfig = {
   apiKey: "AIzaSyBacXD5R0vmrBsXX0k9UGN1KLAZ42Vn7Bc",
@@ -29,6 +30,31 @@ const distToSegmentSquared = (p, v, w) => {
   return dist2(p, { x: v.x + t * (w.x - v.x), y: v.y + t * (w.y - v.y) });
 };
 const distToSegment = (p, v, w) => Math.sqrt(distToSegmentSquared(p, v, w));
+
+const getRoundedPath = (points, radius = 8) => {
+  if (points.length < 4) return `M ${points[0]} ${points[1]}`;
+  if (points.length === 4) return `M ${points[0]} ${points[1]} L ${points[2]} ${points[3]}`;
+  let path = `M ${points[0]} ${points[1]}`;
+  for (let i = 2; i < points.length - 2; i += 2) {
+    const p0 = { x: points[i - 2], y: points[i - 1] };
+    const p1 = { x: points[i], y: points[i + 1] };
+    const p2 = { x: points[i + 2], y: points[i + 3] };
+    const d1 = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+    const d2 = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    if (d1 === 0 || d2 === 0) {
+      path += ` L ${p1.x} ${p1.y}`;
+      continue;
+    }
+    const r = Math.min(radius, d1 / 2, d2 / 2);
+    const p1xStart = p1.x - (p1.x - p0.x) * (r / d1);
+    const p1yStart = p1.y - (p1.y - p0.y) * (r / d1);
+    const p1xEnd = p1.x + (p2.x - p1.x) * (r / d2);
+    const p1yEnd = p1.y + (p2.y - p1.y) * (r / d2);
+    path += ` L ${p1xStart} ${p1yStart} Q ${p1.x} ${p1.y} ${p1xEnd} ${p1yEnd}`;
+  }
+  path += ` L ${points[points.length - 2]} ${points[points.length - 1]}`;
+  return path;
+};
 
 const getPartGlobalPins = (part) => {
   const cx = part.width / 2; 
@@ -74,12 +100,15 @@ function App() {
   const [texts, setTexts] = useState([]); 
   const [stageConfig, setStageConfig] = useState({ scale: 1, x: 0, y: 0 });
   const [bbRows, setBbRows] = useState(30); 
+  const [bbStrips, setBbStrips] = useState(1);
   const [boardPos, setBoardPos] = useState({ x: GRID_SIZE * 4, y: GRID_SIZE * 4 });
   const [wireColor, setWireColor] = useState('#ff0000'); 
   const [drawingWire, setDrawingWire] = useState(null); 
   const [isUsbConnected, setIsUsbConnected] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isTipsOpen, setIsTipsOpen] = useState(false);
+
+  const [lcdInput, setLcdInput] = useState({ open: false, partInstanceId: null, value: '', x: 0, y: 0 });
 
   const [selectedItems, setSelectedItems] = useState([]); 
   const [selectionRect, setSelectionRect] = useState(null); 
@@ -91,6 +120,7 @@ function App() {
 
   const hoveredPinRef = useRef(null);
   const stageRef = useRef(null);
+  const lcdInputRef = useRef(null);
 
   const [editingTextColor, setEditingTextColor] = useState('#333333');
   const [editingTextSize, setEditingTextSize] = useState(24);
@@ -105,6 +135,7 @@ function App() {
 
   useEffect(() => {
     const handleKeyDown = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
       if (e.key === 'Delete' || e.key === 'Backspace') {
         if (selectedItems.length > 0) {
           setWires(prev => prev.filter(w => !selectedItems.some(s => s.id === w.id)));
@@ -124,7 +155,7 @@ function App() {
     const projectData = {
       library: library.map(({ img, ...rest }) => rest), 
       boardParts: boardParts.map(({ img, ...rest }) => rest),
-      wires, texts, bbRows, boardPos, isUsbConnected 
+      wires, texts, bbRows, bbStrips, boardPos, isUsbConnected 
     };
     try {
       await setDoc(doc(db, "projects", projectName), projectData);
@@ -146,17 +177,151 @@ function App() {
           await new Promise(resolve => { img.onload = resolve; });
           return { ...item, img };
         }));
-        const rebuiltParts = data.boardParts.map(part => {
-          if (['resistor', 'ceramic_cap', 'led'].includes(part.partType)) return part; 
+        const rebuiltParts = await Promise.all((data.boardParts || []).map(async (part) => {
+          if (['resistor', 'ceramic_cap', 'led'].includes(part.partType)) return part;
+          if (typeof part.svgContent === 'string' && part.svgContent.length > 0) {
+            const img = new window.Image();
+            img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(part.svgContent)));
+            await new Promise(resolve => { img.onload = resolve; });
+            return { ...part, img };
+          }
           const libItem = rebuiltLibrary.find(l => l.id === part.id);
           return { ...part, img: libItem ? libItem.img : null };
-        });
+        }));
         setLibrary(rebuiltLibrary); setBoardParts(rebuiltParts); setWires(data.wires || []); setTexts(data.texts || []);
-        setBbRows(data.bbRows || 30); setBoardPos(data.boardPos || { x: GRID_SIZE * 4, y: GRID_SIZE * 4 });
+        setBbRows(data.bbRows || 30); setBbStrips(data.bbStrips || 1); setBoardPos(data.boardPos || { x: GRID_SIZE * 4, y: GRID_SIZE * 4 });
         setIsUsbConnected(data.isUsbConnected || false); setSelectedItems([]);
         alert(`✅ 成功載入！`);
       } else alert(`❌ 找不到專案！`);
     } catch (error) { console.error("讀取失敗：", error); }
+  };
+
+  const isLcdPart = (part) => {
+    if (!part || typeof part.svgContent !== 'string') return false;
+    return /lcd-pixel-\d+-\d+/.test(part.svgContent) || part.svgContent.includes('id="lcd-pixels"');
+  };
+
+  const updateLcdDisplay = async (partInstanceId, text) => {
+    const targetPart = boardParts.find(p => p.instanceId === partInstanceId);
+    if (!targetPart || typeof targetPart.svgContent !== 'string') return;
+    if (!isLcdPart(targetPart)) return;
+
+    const rawText = (text ?? '').toString();
+    const processedText = rawText.replace(/Bell/gi, '\u0001');
+    const normalizedText = processedText.padEnd(32, ' ').slice(0, 32);
+    const onPixels = new Set();
+
+    const customGlyphs = {
+      '\u0001': [16, 30, 95, 30, 16] // Bell pattern
+    };
+
+    for (let row = 0; row < 2; row++) {
+      const line = normalizedText.slice(row * 16, row * 16 + 16);
+      for (let charIndex = 0; charIndex < 16; charIndex++) {
+        const ch = line[charIndex] ?? ' ';
+        const glyph = customGlyphs[ch] || font5x8[ch] || font5x8[' '];
+        for (let gx = 0; gx < 5; gx++) {
+          const colBits = glyph[gx] ?? 0;
+          for (let gy = 0; gy < 8; gy++) {
+            if ((colBits & (1 << gy)) === 0) continue;
+            const r = row * 8 + gy;
+            const c = charIndex * 6 + gx;
+            onPixels.add(`${r}-${c}`);
+          }
+        }
+      }
+    }
+
+    const parser = new DOMParser();
+    const svgDoc = parser.parseFromString(targetPart.svgContent, 'image/svg+xml');
+    let pixelEls = Array.from(svgDoc.querySelectorAll('[id^="lcd-pixel-"]'));
+
+    const lcdPixelsGroup = svgDoc.getElementById('lcd-pixels');
+    if (lcdPixelsGroup && pixelEls.length === 0) {
+      const X_POSITIONS = [27.79, 38.534, 49.278, 60.022, 70.768, 81.512, 92.256, 103.0, 113.744, 124.489, 135.233, 145.977, 156.721, 167.465, 178.209, 188.954];
+      const ROW_Y = [34.154, 51.37];
+      const CELL_W = 10.027; const CELL_H = 16.522;
+      const COLS = 5; const ROWS = 8;
+      const PAD_X = 0.8; const PAD_Y = 0.8; const GAP = 0.15;
+      const PX_W = (CELL_W - 2 * PAD_X - GAP * (COLS - 1)) / COLS;
+      const PX_H = (CELL_H - 2 * PAD_Y - GAP * (ROWS - 1)) / ROWS;
+      const ns = 'http://www.w3.org/2000/svg';
+
+      for (let rowIdx = 0; rowIdx < 2; rowIdx++) {
+        const cy = ROW_Y[rowIdx];
+        for (let colIdx = 0; colIdx < 16; colIdx++) {
+          const cx = X_POSITIONS[colIdx];
+          const bg = svgDoc.createElementNS(ns, 'rect');
+          bg.setAttribute('x', cx); bg.setAttribute('y', cy);
+          bg.setAttribute('width', CELL_W); bg.setAttribute('height', CELL_H);
+          bg.setAttribute('fill', '#1A1A1A'); bg.setAttribute('fill-opacity', '0.08');
+          lcdPixelsGroup.appendChild(bg);
+
+          for (let py = 0; py < ROWS; py++) {
+            for (let px = 0; px < COLS; px++) {
+              const rect = svgDoc.createElementNS(ns, 'rect');
+              const rx = cx + PAD_X + px * (PX_W + GAP);
+              const ry = cy + PAD_Y + py * (PX_H + GAP);
+              rect.setAttribute('x', rx.toFixed(3));
+              rect.setAttribute('y', ry.toFixed(3));
+              rect.setAttribute('width', PX_W.toFixed(3));
+              rect.setAttribute('height', PX_H.toFixed(3));
+              rect.setAttribute('rx', '0.1');
+              rect.setAttribute('fill', '#1A1A1A');
+              
+              const r = rowIdx * 8 + py;
+              const c = colIdx * 6 + px;
+              rect.setAttribute('id', `lcd-pixel-${r}-${c}`);
+              lcdPixelsGroup.appendChild(rect);
+            }
+          }
+        }
+      }
+      pixelEls = Array.from(svgDoc.querySelectorAll('[id^="lcd-pixel-"]'));
+    }
+
+    if (pixelEls.length === 0) return;
+
+    pixelEls.forEach((el) => {
+      const id = el.getAttribute('id') || '';
+      const m = id.match(/^lcd-pixel-(\d+)-(\d+)$/);
+      if (!m) return;
+      const key = `${Number(m[1])}-${Number(m[2])}`;
+      el.setAttribute('opacity', onPixels.has(key) ? '1' : '0');
+    });
+
+    const updatedSvgContent = new XMLSerializer().serializeToString(svgDoc);
+    const img = new window.Image();
+    img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(updatedSvgContent)));
+    await new Promise(resolve => { img.onload = resolve; });
+
+    setBoardParts(prev => prev.map(p => (
+      p.instanceId === partInstanceId
+        ? { ...p, svgContent: updatedSvgContent, img, lcdText: rawText }
+        : p
+    )));
+  };
+
+  const openLcdEditor = (part, e) => {
+    if (!isLcdPart(part)) return;
+    e.cancelBubble = true;
+    e.evt?.preventDefault?.();
+
+    const stage = stageRef.current;
+    if (!stage) return;
+    const rect = stage.container().getBoundingClientRect();
+
+    const x = (e.evt?.clientX ?? rect.left) - rect.left;
+    const y = (e.evt?.clientY ?? rect.top) - rect.top;
+
+    setLcdInput({
+      open: true,
+      partInstanceId: part.instanceId,
+      value: (part.lcdText ?? '').toString(),
+      x: Math.max(0, Math.min(rect.width - 10, x)),
+      y: Math.max(0, Math.min(rect.height - 10, y))
+    });
+    setTimeout(() => lcdInputRef.current?.focus(), 0);
   };
 
   const handleExportImage = () => {
@@ -207,10 +372,38 @@ function App() {
     event.target.value = null; 
   };
 
+  const alignPartPinsToBreadboard = (part, maxSnapDistance = GRID_SIZE * 2) => {
+    if (!part || !part.pins || part.pins.length === 0) return { x: part.x, y: part.y, snapped: false };
+
+    const globalPins = getPartGlobalPins(part);
+    let best = null;
+
+    for (const gPin of globalPins) {
+      for (const hole of bbLayout.holes) {
+        const holeX = boardPos.x + hole.x;
+        const holeY = boardPos.y + hole.y;
+        const dx = holeX - gPin.gx;
+        const dy = holeY - gPin.gy;
+        const d2 = dx * dx + dy * dy;
+        if (!best || d2 < best.d2) best = { d2, dx, dy };
+      }
+    }
+
+    if (!best) return { x: part.x, y: part.y, snapped: false };
+    const dist = Math.sqrt(best.d2);
+    if (dist > maxSnapDistance) return { x: part.x, y: part.y, snapped: false };
+    return { x: part.x + best.dx, y: part.y + best.dy, snapped: true };
+  };
+
   const addPartToBoard = (template) => {
     const centerX = (-stageConfig.x + window.innerWidth / 2) / stageConfig.scale;
     const centerY = (-stageConfig.y + window.innerHeight / 2) / stageConfig.scale;
-    setBoardParts(prev => [...prev, { ...template, instanceId: Date.now().toString(), x: Math.round(centerX/GRID_SIZE)*GRID_SIZE, y: Math.round(centerY/GRID_SIZE)*GRID_SIZE, rotation: 0 }]);
+    const snapX = Math.round(centerX / GRID_SIZE) * GRID_SIZE;
+    const snapY = Math.round(centerY / GRID_SIZE) * GRID_SIZE;
+    const basePart = { ...template, instanceId: Date.now().toString(), x: snapX, y: snapY, rotation: 0 };
+    const aligned = alignPartPinsToBreadboard(basePart);
+    const newPart = aligned.snapped ? { ...basePart, x: aligned.x, y: aligned.y } : basePart;
+    setBoardParts(prev => [...prev, newPart]);
   };
 
   const addDynamicPart = (type) => {
@@ -537,8 +730,8 @@ function App() {
       }
     }
   };
-  
-  // 🎯 重點修復：依照旋轉角度決定網格相位的智慧吸附系統
+
+  // 依照引腳位置優先吸附到麵包板洞位，若不在附近則回退到網格吸附
   const handleItemDragEnd = (e, id, type) => {
     if (type === 'text') { setTexts(prev => prev.map(t => t.id === id ? { ...t, x: Math.round(e.target.x()/GRID_SIZE)*GRID_SIZE, y: Math.round(e.target.y()/GRID_SIZE)*GRID_SIZE } : t)); return; }
     
@@ -546,14 +739,19 @@ function App() {
       const part = boardParts.find(p => p.instanceId === id);
       if (!part) return;
 
-      let snappedX, snappedY;
-      
-      // 如果元件旋轉了 90 或 270 度，中心點必須偏移半格 (GRID_SIZE/2) 才能讓引腳對齊洞口
-      if (part.rotation % 180 !== 0) {
+      const draggedPart = { ...part, x: e.target.x(), y: e.target.y() };
+      const aligned = alignPartPinsToBreadboard(draggedPart);
+
+      let snappedX;
+      let snappedY;
+      if (aligned.snapped) {
+        snappedX = aligned.x;
+        snappedY = aligned.y;
+      } else if (part.rotation % 180 !== 0) {
         snappedX = Math.round((e.target.x() - GRID_SIZE/2) / GRID_SIZE) * GRID_SIZE + GRID_SIZE/2;
         snappedY = Math.round((e.target.y() - GRID_SIZE/2) / GRID_SIZE) * GRID_SIZE + GRID_SIZE/2;
       } else {
-        snappedX = Math.round(e.target.x() / GRID_SIZE) * GRID_SIZE; 
+        snappedX = Math.round(e.target.x() / GRID_SIZE) * GRID_SIZE;
         snappedY = Math.round(e.target.y() / GRID_SIZE) * GRID_SIZE;
       }
       
@@ -595,6 +793,7 @@ function App() {
     if (e.evt.button === 2) return; 
     setSelectedItems([{ id, type }]); 
     if (type === 'text') { const text = texts.find(t => t.id === id); if (text) { setEditingTextColor(text.color); setEditingTextSize(text.fontSize); } }
+    if (type === 'wire') { const wire = wires.find(w => w.id === id); if (wire) setWireColor(wire.color); }
   };
 
   const addTextNode = () => {
@@ -603,15 +802,29 @@ function App() {
   };
 
   const generateBreadboard = () => {
-    const holes = []; const width = 24 * GRID_SIZE; const height = (bbRows + 2) * GRID_SIZE;
-    for (let row = 0; row < bbRows; row++) {
-      const y = (row + 1) * GRID_SIZE;
-      holes.push({ x: 1.5 * GRID_SIZE, y, type: 'power', color: '#ff4444' }); holes.push({ x: 2.5 * GRID_SIZE, y, type: 'power', color: '#4444ff' }); 
-      for (let c = 4.5; c <= 8.5; c++) holes.push({ x: c * GRID_SIZE, y, type: 'terminal', color: '#555' }); 
-      for (let c = 15.5; c <= 19.5; c++) holes.push({ x: c * GRID_SIZE, y, type: 'terminal', color: '#555' }); 
-      holes.push({ x: 21.5 * GRID_SIZE, y, type: 'power', color: '#4444ff' }); holes.push({ x: 22.5 * GRID_SIZE, y, type: 'power', color: '#ff4444' }); 
+    const holes = [];
+    const segmentWidth = 24 * GRID_SIZE;
+    const segmentHeight = (bbRows + 2) * GRID_SIZE;
+    const segmentGap = 2 * GRID_SIZE;
+    const segmentLefts = [];
+
+    for (let s = 0; s < bbStrips; s++) {
+      const xOffset = s * (segmentWidth + segmentGap);
+      segmentLefts.push(xOffset);
+      for (let row = 0; row < bbRows; row++) {
+        const y = (row + 1) * GRID_SIZE;
+        holes.push({ x: xOffset + 1.5 * GRID_SIZE, y, type: 'power', color: '#ff4444' });
+        holes.push({ x: xOffset + 2.5 * GRID_SIZE, y, type: 'power', color: '#4444ff' });
+        for (let c = 4.5; c <= 8.5; c++) holes.push({ x: xOffset + c * GRID_SIZE, y, type: 'terminal', color: '#555' });
+        for (let c = 15.5; c <= 19.5; c++) holes.push({ x: xOffset + c * GRID_SIZE, y, type: 'terminal', color: '#555' });
+        holes.push({ x: xOffset + 21.5 * GRID_SIZE, y, type: 'power', color: '#4444ff' });
+        holes.push({ x: xOffset + 22.5 * GRID_SIZE, y, type: 'power', color: '#ff4444' });
+      }
     }
-    return { width, height, holes };
+
+    const width = bbStrips * segmentWidth + (bbStrips - 1) * segmentGap;
+    const height = segmentHeight;
+    return { width, height, holes, segmentLefts, segmentHeight, segmentWidth };
   };
   const bbLayout = generateBreadboard();
 
@@ -633,10 +846,19 @@ function App() {
           </div>
 
           <div style={{ display: 'flex', gap: '5px', alignItems: 'center', borderLeft: '2px solid #ccc', paddingLeft: '15px' }}>
+            <b>條數:</b>
+            <select value={bbStrips} onChange={e => setBbStrips(Number(e.target.value))}>
+              <option value={1}>單條</option>
+              <option value={2}>雙條</option>
+            </select>
+          </div>
+
+          <div style={{ display: 'flex', gap: '5px', alignItems: 'center', borderLeft: '2px solid #ccc', paddingLeft: '15px' }}>
             <b>導線:</b>
             {['#ff0000', '#000000', '#0000ff', '#00ff00', '#ffff00'].map(c => (
-              <div key={c} onClick={() => setWireColor(c)} style={{ width: '20px', height: '20px', backgroundColor: c, border: wireColor === c ? '3px solid #333' : '1px solid #ccc', cursor: 'pointer', borderRadius: '50%' }} />
+              <div key={c} onClick={() => { setWireColor(c); if (selectedItems.some(s => s.type === 'wire')) setWires(prev => prev.map(w => selectedItems.some(s => s.id === w.id) ? { ...w, color: c } : w)); }} style={{ width: '20px', height: '20px', backgroundColor: c, border: wireColor === c ? '3px solid #333' : '1px solid #ccc', cursor: 'pointer', borderRadius: '50%' }} />
             ))}
+            <input type="color" value={wireColor} onChange={e => { setWireColor(e.target.value); if (selectedItems.some(s => s.type === 'wire')) setWires(prev => prev.map(w => selectedItems.some(s => s.id === w.id) ? { ...w, color: e.target.value } : w)); }} style={{ width: '28px', height: '28px', padding: 0, border: 'none', background: 'transparent', cursor: 'pointer' }} title="自訂導線顏色" />
           </div>
 
           <button onClick={addTextNode} style={{ borderLeft: '2px solid #ccc', paddingLeft: '15px', background: 'none', border: 'none', cursor: 'pointer', fontSize: '15px', color: '#0066cc', fontWeight: 'bold' }}>➕ 文字</button>
@@ -712,6 +934,39 @@ function App() {
 
         {/* ================= 繪圖主畫布 ================= */}
         <div style={{ flex: 1, border: '2px solid #333', backgroundColor: '#e0e0e0', overflow: 'hidden', position: 'relative' }}>
+          {lcdInput.open ? (
+            <input
+              ref={lcdInputRef}
+              value={lcdInput.value}
+              onChange={(e) => setLcdInput(prev => ({ ...prev, value: e.target.value }))}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  e.currentTarget.blur();
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setLcdInput({ open: false, partInstanceId: null, value: '', x: 0, y: 0 });
+                }
+              }}
+              onBlur={async () => {
+                const snapshot = lcdInput;
+                setLcdInput({ open: false, partInstanceId: null, value: '', x: 0, y: 0 });
+                if (snapshot.partInstanceId) await updateLcdDisplay(snapshot.partInstanceId, snapshot.value);
+              }}
+              style={{
+                position: 'absolute',
+                left: `${lcdInput.x}px`,
+                top: `${lcdInput.y}px`,
+                zIndex: 20,
+                width: '280px',
+                padding: '6px 8px',
+                borderRadius: '6px',
+                border: '1px solid #666',
+                outline: 'none'
+              }}
+              placeholder="輸入 LCD 內容（Enter 確定 / Esc 取消）"
+            />
+          ) : null}
           <Stage 
             ref={stageRef} width={window.innerWidth - (isSidebarOpen ? 320 : 50)} height={window.innerHeight - 150}
             draggable={false} 
@@ -729,15 +984,19 @@ function App() {
                 onDragStart={handleBoardDragStart} onDragMove={handleBoardDragMove} onDragEnd={handleBoardDragEnd} onClick={(e) => handleItemClick(e, 'breadboard', 'board')}
               >
                 <Rect width={bbLayout.width} height={bbLayout.height} fill="#ffffff" cornerRadius={6} shadowBlur={selectedItems.some(s => s.id === 'breadboard') ? 15 : 5} shadowColor={selectedItems.some(s => s.id === 'breadboard') ? 'blue' : 'black'} />
-                <Rect x={9.5 * GRID_SIZE} y={0} width={5 * GRID_SIZE} height={bbLayout.height} fill="#f0f0f0" />
-                {['a','b','c','d','e'].map((letter, i) => <Text key={letter} x={(i+4.5)*GRID_SIZE - 4} y={6} text={letter} fontSize={10} fill="#888" fontStyle="bold" />)}
-                {['f','g','h','i','j'].map((letter, i) => <Text key={letter} x={(i+15.5)*GRID_SIZE - 4} y={6} text={letter} fontSize={10} fill="#888" fontStyle="bold" />)}
-                {Array.from({length: bbRows}).map((_, i) => <Text key={`row-${i}`} x={3.2 * GRID_SIZE} y={(i+1)*GRID_SIZE - 5} text={i+1} fontSize={10} fill="#888" />)}
-                {Array.from({length: bbRows}).map((_, i) => <Text key={`row2-${i}`} x={20.2 * GRID_SIZE} y={(i+1)*GRID_SIZE - 5} text={i+1} fontSize={10} fill="#888" />)}
-                <Line points={[1 * GRID_SIZE, GRID_SIZE, 1 * GRID_SIZE, bbLayout.height - GRID_SIZE]} stroke="red" strokeWidth={2} opacity={0.5} />
-                <Line points={[3 * GRID_SIZE, GRID_SIZE, 3 * GRID_SIZE, bbLayout.height - GRID_SIZE]} stroke="blue" strokeWidth={2} opacity={0.5} />
-                <Line points={[21 * GRID_SIZE, GRID_SIZE, 21 * GRID_SIZE, bbLayout.height - GRID_SIZE]} stroke="blue" strokeWidth={2} opacity={0.5} />
-                <Line points={[23 * GRID_SIZE, GRID_SIZE, 23 * GRID_SIZE, bbLayout.height - GRID_SIZE]} stroke="red" strokeWidth={2} opacity={0.5} />
+                {bbLayout.segmentLefts.map((left, segIdx) => (
+                  <Group key={`bb-seg-${segIdx}`} listening={false}>
+                    <Rect x={left + 9.5 * GRID_SIZE} y={0} width={5 * GRID_SIZE} height={bbLayout.segmentHeight} fill="#f0f0f0" />
+                    {['a','b','c','d','e'].map((letter, i) => <Text key={`${segIdx}-${letter}`} x={left + (i+4.5)*GRID_SIZE - 4} y={6} text={letter} fontSize={10} fill="#888" fontStyle="bold" />)}
+                    {['f','g','h','i','j'].map((letter, i) => <Text key={`${segIdx}-r-${letter}`} x={left + (i+15.5)*GRID_SIZE - 4} y={6} text={letter} fontSize={10} fill="#888" fontStyle="bold" />)}
+                    {Array.from({length: bbRows}).map((_, i) => <Text key={`row-${segIdx}-${i}`} x={left + 3.2 * GRID_SIZE} y={(i+1)*GRID_SIZE - 5} text={i+1} fontSize={10} fill="#888" />)}
+                    {Array.from({length: bbRows}).map((_, i) => <Text key={`row2-${segIdx}-${i}`} x={left + 20.2 * GRID_SIZE} y={(i+1)*GRID_SIZE - 5} text={i+1} fontSize={10} fill="#888" />)}
+                    <Line points={[left + 1 * GRID_SIZE, GRID_SIZE, left + 1 * GRID_SIZE, bbLayout.segmentHeight - GRID_SIZE]} stroke="red" strokeWidth={2} opacity={0.5} />
+                    <Line points={[left + 3 * GRID_SIZE, GRID_SIZE, left + 3 * GRID_SIZE, bbLayout.segmentHeight - GRID_SIZE]} stroke="blue" strokeWidth={2} opacity={0.5} />
+                    <Line points={[left + 21 * GRID_SIZE, GRID_SIZE, left + 21 * GRID_SIZE, bbLayout.segmentHeight - GRID_SIZE]} stroke="blue" strokeWidth={2} opacity={0.5} />
+                    <Line points={[left + 23 * GRID_SIZE, GRID_SIZE, left + 23 * GRID_SIZE, bbLayout.segmentHeight - GRID_SIZE]} stroke="red" strokeWidth={2} opacity={0.5} />
+                  </Group>
+                ))}
                 
                 <Group listening={true}>
                   {bbLayout.holes.map((hole, i) => (
@@ -751,8 +1010,8 @@ function App() {
 
               {wires.map(wire => (
                 <Group key={wire.id}>
-                  <Line 
-                    points={wire.points} tension={0.5} stroke={selectedItems.some(s => s.id === wire.id) ? '#00e5ff' : wire.color} 
+                  <Path 
+                    data={getRoundedPath(wire.points, 8)} stroke={selectedItems.some(s => s.id === wire.id) ? '#00e5ff' : wire.color} 
                     strokeWidth={selectedItems.some(s => s.id === wire.id) ? 6 : 4} hitStrokeWidth={15} lineCap="round" lineJoin="round" shadowBlur={selectedItems.some(s => s.id === wire.id) ? 10 : 2} 
                     onClick={(e) => handleItemClick(e, wire.id, 'wire')} onDblClick={(e) => handleWireDblClick(e, wire.id)} 
                     onMouseEnter={(e) => e.target.getStage().container().style.cursor = 'pointer'} onMouseLeave={(e) => e.target.getStage().container().style.cursor = 'default'}
@@ -779,8 +1038,9 @@ function App() {
                   key={part.instanceId} x={part.x} y={part.y} rotation={part.rotation} offset={{ x: part.width / 2, y: part.height / 2 }} draggable 
                   onDragStart={(e) => handlePartDragStart(e, part.instanceId)}
                   onClick={(e) => handleItemClick(e, part.instanceId, 'part')} 
+                  onDblClick={(e) => openLcdEditor(part, e)}
                   
-                  // 🎯 重點修復：右鍵旋轉也會啟動智慧相位偏移，並帶著導線一起轉！
+                  // 右鍵旋轉時：導線跟隨 + 優先以引腳貼齊麵包板洞位
                   onContextMenu={(e) => { 
                     e.evt.preventDefault(); 
                     if (hasPanned.current) return; 
@@ -808,7 +1068,11 @@ function App() {
                       newY = Math.round(part.y / GRID_SIZE) * GRID_SIZE;
                     }
                     
-                    const updatedPart = { ...part, rotation: newRot, x: newX, y: newY };
+                    const preAlignedPart = { ...part, rotation: newRot, x: newX, y: newY };
+                    const alignedAfterRotate = alignPartPinsToBreadboard(preAlignedPart);
+                    const updatedPart = alignedAfterRotate.snapped
+                      ? { ...preAlignedPart, x: alignedAfterRotate.x, y: alignedAfterRotate.y }
+                      : preAlignedPart;
                     setBoardParts(prev => prev.map(p => p.instanceId === part.instanceId ? updatedPart : p)); 
                     
                     if (connections.length > 0) {
