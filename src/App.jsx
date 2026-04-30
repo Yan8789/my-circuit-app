@@ -1,8 +1,8 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import JSZip from 'jszip';
 import { Stage, Layer, Image as KonvaImage, Group, Circle, Rect, Line, Text, Path } from 'react-konva';
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, setDoc, getDoc } from "firebase/firestore";
+import { getFirestore, doc, setDoc, getDoc, collection, getDocs, deleteDoc } from "firebase/firestore";
 import { font5x8 } from './lcdFont.js';
 
 const firebaseConfig = {
@@ -124,8 +124,49 @@ function App() {
 
   const [editingTextColor, setEditingTextColor] = useState('#333333');
   const [editingTextSize, setEditingTextSize] = useState(24);
+  const [savedProjects, setSavedProjects] = useState([]);
+  const [selectedProjectName, setSelectedProjectName] = useState('');
+  const [isProjectDropdownOpen, setIsProjectDropdownOpen] = useState(false);
 
   const singleSelectedItem = selectedItems.length === 1 ? selectedItems[0] : { id: null, type: null };
+
+  // --- UNDO / REDO STATE ---
+  const [past, setPast] = useState([]);
+  const [future, setFuture] = useState([]);
+
+  const currentStateRef = useRef({ boardParts, wires, texts, bbRows, bbStrips, boardPos, isUsbConnected });
+  useEffect(() => {
+    currentStateRef.current = { boardParts, wires, texts, bbRows, bbStrips, boardPos, isUsbConnected };
+  }, [boardParts, wires, texts, bbRows, bbStrips, boardPos, isUsbConnected]);
+
+  const saveSnapshot = () => {
+    const currentState = currentStateRef.current;
+    setPast(prev => {
+      if (prev.length > 0 && JSON.stringify(prev[prev.length - 1]) === JSON.stringify(currentState)) return prev;
+      return [...prev, currentState];
+    });
+    setFuture([]);
+  };
+
+  const handleUndo = useCallback(() => {
+    if (past.length === 0) return;
+    const previousState = past[past.length - 1];
+    setPast(prev => prev.slice(0, prev.length - 1));
+    setFuture(prev => [currentStateRef.current, ...prev]);
+    
+    setBoardParts(previousState.boardParts); setWires(previousState.wires); setTexts(previousState.texts);
+    setBbRows(previousState.bbRows); setBbStrips(previousState.bbStrips); setBoardPos(previousState.boardPos); setIsUsbConnected(previousState.isUsbConnected);
+  }, [past]);
+
+  const handleRedo = useCallback(() => {
+    if (future.length === 0) return;
+    const nextState = future[0];
+    setFuture(prev => prev.slice(1));
+    setPast(prev => [...prev, currentStateRef.current]);
+    
+    setBoardParts(nextState.boardParts); setWires(nextState.wires); setTexts(nextState.texts);
+    setBbRows(nextState.bbRows); setBbStrips(nextState.bbStrips); setBoardPos(nextState.boardPos); setIsUsbConnected(nextState.isUsbConnected);
+  }, [future]);
 
   useEffect(() => {
     if (singleSelectedItem.type === 'text') {
@@ -136,8 +177,24 @@ function App() {
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      
+      // Handle Undo/Redo Shortcuts
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === 'z' || e.key === 'Z') {
+          e.preventDefault();
+          if (e.shiftKey) handleRedo(); else handleUndo();
+          return;
+        }
+        if (e.key === 'y' || e.key === 'Y') {
+          e.preventDefault();
+          handleRedo();
+          return;
+        }
+      }
+
       if (e.key === 'Delete' || e.key === 'Backspace') {
         if (selectedItems.length > 0) {
+          saveSnapshot();
           setWires(prev => prev.filter(w => !selectedItems.some(s => s.id === w.id)));
           setBoardParts(prev => prev.filter(p => !selectedItems.some(s => s.id === p.instanceId)));
           setTexts(prev => prev.filter(t => !selectedItems.some(s => s.id === t.id)));
@@ -147,36 +204,96 @@ function App() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedItems]);
+  }, [selectedItems, handleUndo, handleRedo]);
+
+  // 初始化时从Firebase加载库和项目列表
+  useEffect(() => {
+    const loadFromFirebase = async () => {
+      try {
+        // 加载保存的零件库
+        const libSnapshot = await getDocs(collection(db, 'components'));
+        if (libSnapshot.docs.length > 0) {
+          const loadedLib = await Promise.all(libSnapshot.docs.map(async docSnap => {
+            const item = docSnap.data();
+            const img = new window.Image();
+            img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(item.svgContent)));
+            await new Promise(resolve => { img.onload = resolve; });
+            return { ...item, img };
+          }));
+          setLibrary(loadedLib);
+        }
+
+        // 加载项目列表
+        const projectSnapshot = await getDocs(collection(db, 'projects'));
+        const projectNames = projectSnapshot.docs.map(doc => doc.id);
+        setSavedProjects(projectNames);
+      } catch (error) {
+        console.error('初始化加载失败:', error);
+      }
+    };
+    loadFromFirebase();
+  }, []);
 
   const handleSaveToCloud = async () => {
-    const projectName = window.prompt("☁️ 請為您的電路專案命名：", "Pico_Project_01");
-    if (!projectName) return; 
+    let projectName = prompt("☁️ 請為您的電路專案命名：", "Pico_Project_" + new Date().getTime().toString().slice(-6));
+    if (!projectName) return;
+    projectName = projectName.trim();
+    
     const projectData = {
       library: library.map(({ img, ...rest }) => rest), 
       boardParts: boardParts.map(({ img, ...rest }) => rest),
-      wires, texts, bbRows, bbStrips, boardPos, isUsbConnected 
+      wires, texts, bbRows, bbStrips, boardPos, isUsbConnected,
+      savedAt: new Date().toISOString()
     };
     try {
       await setDoc(doc(db, "projects", projectName), projectData);
+      setSavedProjects(prev => prev.includes(projectName) ? prev : [...prev, projectName]);
+      setSelectedProjectName(projectName);
       alert(`✅ 專案 [${projectName}] 已成功儲存！`);
-    } catch (error) { alert("❌ 儲存失敗！"); }
+    } catch (error) { alert("❌ 儲存失敗！" + error.message); }
   };
 
-  const handleLoadFromCloud = async () => {
-    const projectName = window.prompt("☁️ 請輸入要讀取的專案名稱：", "Pico_Project_01");
+  const handleLoadFromCloud = async (projectName) => {
     if (!projectName) return;
     if (!window.confirm(`即將從雲端載入 [${projectName}]，這會覆蓋目前的畫布，確定嗎？`)) return;
     try {
       const docSnap = await getDoc(doc(db, "projects", projectName));
       if (docSnap.exists()) {
+        saveSnapshot();
         const data = docSnap.data();
-        const rebuiltLibrary = await Promise.all(data.library.map(async item => {
-          const img = new window.Image();
-          img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(item.svgContent)));
-          await new Promise(resolve => { img.onload = resolve; });
-          return { ...item, img };
-        }));
+        // 將專案中不存在於目前零件庫的元件加入，但不覆蓋整個零件庫
+        let updatedLibrary = [...library];
+        const existingIds = new Set(updatedLibrary.map(l => l.id));
+        
+        const idMapping = {};
+        const missingComponentsData = [];
+
+        (data.library || []).forEach(item => {
+          if (existingIds.has(item.id)) {
+            idMapping[item.id] = item.id;
+          } else {
+            // 尋找是否已有相同名稱與內容的元件，避免重複疊加在零件庫
+            const duplicateMatch = updatedLibrary.find(l => l.title === item.title && l.svgContent === item.svgContent);
+            if (duplicateMatch) {
+              idMapping[item.id] = duplicateMatch.id;
+            } else {
+              missingComponentsData.push(item);
+              idMapping[item.id] = item.id;
+            }
+          }
+        });
+
+        if (missingComponentsData.length > 0) {
+          const newComponents = await Promise.all(missingComponentsData.map(async item => {
+            const img = new window.Image();
+            img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(item.svgContent)));
+            await new Promise(resolve => { img.onload = resolve; });
+            return { ...item, img };
+          }));
+          updatedLibrary.push(...newComponents);
+          setLibrary(updatedLibrary);
+        }
+
         const rebuiltParts = await Promise.all((data.boardParts || []).map(async (part) => {
           if (['resistor', 'ceramic_cap', 'led'].includes(part.partType)) return part;
           if (typeof part.svgContent === 'string' && part.svgContent.length > 0) {
@@ -185,15 +302,33 @@ function App() {
             await new Promise(resolve => { img.onload = resolve; });
             return { ...part, img };
           }
-          const libItem = rebuiltLibrary.find(l => l.id === part.id);
-          return { ...part, img: libItem ? libItem.img : null };
+          const mappedId = idMapping[part.id] || part.id;
+          const libItem = updatedLibrary.find(l => l.id === mappedId);
+          return { ...part, id: mappedId, img: libItem ? libItem.img : null };
         }));
-        setLibrary(rebuiltLibrary); setBoardParts(rebuiltParts); setWires(data.wires || []); setTexts(data.texts || []);
+        setBoardParts(rebuiltParts); setWires(data.wires || []); setTexts(data.texts || []);
         setBbRows(data.bbRows || 30); setBbStrips(data.bbStrips || 1); setBoardPos(data.boardPos || { x: GRID_SIZE * 4, y: GRID_SIZE * 4 });
         setIsUsbConnected(data.isUsbConnected || false); setSelectedItems([]);
+        setSelectedProjectName(projectName);
         alert(`✅ 成功載入！`);
       } else alert(`❌ 找不到專案！`);
-    } catch (error) { console.error("讀取失敗：", error); }
+    } catch (error) { console.error("讀取失敗：", error); alert("❌ 讀取失敗！"); }
+  };
+
+  const handleDeleteProject = async (projectName) => {
+    if (!projectName) return;
+    if (!window.confirm(`確定要永久刪除專案 [${projectName}] 嗎？此操作無法復原。`)) return;
+    try {
+      await deleteDoc(doc(db, "projects", projectName));
+      setSavedProjects(prev => prev.filter(p => p !== projectName));
+      if (selectedProjectName === projectName) {
+        setSelectedProjectName('');
+      }
+      alert(`✅ 專案 [${projectName}] 已成功刪除！`);
+    } catch (error) {
+      console.error("刪除失敗：", error);
+      alert("❌ 刪除失敗！" + error.message);
+    }
   };
 
   const isLcdPart = (part) => {
@@ -295,6 +430,7 @@ function App() {
     img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(updatedSvgContent)));
     await new Promise(resolve => { img.onload = resolve; });
 
+    saveSnapshot();
     setBoardParts(prev => prev.map(p => (
       p.instanceId === partInstanceId
         ? { ...p, svgContent: updatedSvgContent, img, lcdText: rawText }
@@ -325,11 +461,14 @@ function App() {
   };
 
   const handleExportImage = () => {
-    setSelectedItems([]); 
+    setSelectedItems([]);
     setTimeout(() => {
       if (stageRef.current) {
-        const dataURL = stageRef.current.toDataURL({ pixelRatio: 2 }); 
-        const link = document.createElement('a'); link.href = dataURL; link.download = `Circuit_${Date.now()}.png`; link.click();
+        const dataURL = stageRef.current.toDataURL({ pixelRatio: 2 });
+        const link = document.createElement('a');
+        link.href = dataURL;
+        link.download = `Circuit_${Date.now()}.png`;
+        link.click();
       }
     }, 150);
   };
@@ -356,7 +495,7 @@ function App() {
       let vbHeight = parseFloat(svgRoot.getAttribute('viewBox')?.split(/[ ,]+/)[3]) || parseFloat(svgRoot.getAttribute('height')) || 1;
 
       const img = new window.Image(); img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svgContent)));
-      img.onload = () => {
+      img.onload = async () => {
         const extractedPins = [];
         connectors.forEach(conn => {
           if (!conn.svgId) return; const el = svgDoc.getElementById(conn.svgId);
@@ -366,7 +505,20 @@ function App() {
             extractedPins.push({ id: conn.id, name: conn.name, x: x * (img.width / vbWidth) * DPI_SCALE, y: y * (img.height / vbHeight) * DPI_SCALE });
           }
         });
-        setLibrary(prev => [...prev, { id: Date.now().toString(), title, svgContent, img, pins: extractedPins, width: img.width * DPI_SCALE, height: img.height * DPI_SCALE }]);
+        
+        const componentId = Date.now().toString();
+        const newComponent = { id: componentId, title, svgContent, pins: extractedPins, width: img.width * DPI_SCALE, height: img.height * DPI_SCALE };
+        
+        // 保存到Firebase
+        try {
+          await setDoc(doc(db, 'components', componentId), newComponent);
+          setLibrary(prev => [...prev, { ...newComponent, img }]);
+          alert(`✅ 零件 [${title}] 已上传并保存！`);
+        } catch (error) {
+          console.error('保存失败:', error);
+          alert('❌ 保存到云端失败，但零件已在本地加载');
+          setLibrary(prev => [...prev, { ...newComponent, img }]);
+        }
       };
     } catch (error) { console.error("解析失敗:", error); }
     event.target.value = null; 
@@ -403,6 +555,7 @@ function App() {
     const basePart = { ...template, instanceId: Date.now().toString(), x: snapX, y: snapY, rotation: 0 };
     const aligned = alignPartPinsToBreadboard(basePart);
     const newPart = aligned.snapped ? { ...basePart, x: aligned.x, y: aligned.y } : basePart;
+    saveSnapshot();
     setBoardParts(prev => [...prev, newPart]);
   };
 
@@ -423,14 +576,17 @@ function App() {
         newPart = { ...newPart, title: 'LED', width: 30, height: 15, color: '#e74c3c', pins: [{ id: 'p1', x: 7.5, y: 7.5 }, { id: 'p2', x: 22.5, y: 7.5 }] }; break;
       default: return;
     }
+    saveSnapshot();
     setBoardParts(prev => [...prev, newPart]);
   };
 
   const handleDynamicPropChange = (id, propName, value) => {
+    saveSnapshot();
     setBoardParts(prev => prev.map(p => (p.instanceId === id ? { ...p, [propName]: value } : p)));
   };
 
   const handleResistorBandChange = (id, bandIdx, colorIdx) => {
+    saveSnapshot();
     setBoardParts(prev => prev.map(p => {
       if (p.instanceId === id && p.partType === 'resistor') {
         const newBands = [...p.bands]; newBands[bandIdx] = colorIdx; return { ...p, bands: newBands };
@@ -494,6 +650,7 @@ function App() {
     e.cancelBubble = true; const stage = e.target.getStage(); const pointer = stage.getPointerPosition();
     if (!pointer) return; 
     const clickPos = { x: (pointer.x - stage.x()) / stage.scaleX(), y: (pointer.y - stage.y()) / stage.scaleY() };
+    saveSnapshot();
     setWires(prev => prev.map(w => {
       if (w.id !== wireId) return w;
       const pts = w.points; let minD = Infinity; let insertIdx = 2; 
@@ -527,6 +684,7 @@ function App() {
 
   const handleJointDblClick = (e, wireId, index) => {
     e.cancelBubble = true;
+    saveSnapshot();
     setWires(prev => prev.map(w => {
       if (w.id !== wireId) return w;
       const newPts = [...w.points]; newPts.splice(index, 2); return { ...w, points: newPts };
@@ -635,6 +793,7 @@ function App() {
     }
 
     if (drawingWire && hoveredPinRef.current) {
+      saveSnapshot();
       const endPoint = hoveredPinRef.current;
       setWires(prev => [...prev, { id: Date.now().toString(), points: [drawingWire.startX, drawingWire.startY, endPoint.x, endPoint.y], color: drawingWire.color }]);
     }
@@ -646,6 +805,7 @@ function App() {
   const handleBoardDragStart = (e) => {
     if (e.evt.button === 2) { e.target.stopDrag(); return; }
     if (e.target.id() !== 'breadboard-group' && e.target.nodeType !== 'Rect' && e.target.nodeType !== 'Text') return;
+    saveSnapshot();
     boardDragStartPos.current = { x: boardPos.x, y: boardPos.y };
     initialPartsPos.current = boardParts.map(p => ({ ...p })); initialWiresPos.current = wires.map(w => ({ ...w, points: [...w.points] }));
   };
@@ -687,6 +847,7 @@ function App() {
     const part = boardParts.find(p => p.instanceId === partId);
     if (!part) return;
 
+    saveSnapshot();
     const globalPins = getPartGlobalPins(part);
     const connections = [];
 
@@ -798,6 +959,7 @@ function App() {
 
   const addTextNode = () => {
     const centerX = (-stageConfig.x + window.innerWidth / 2) / stageConfig.scale; const centerY = (-stageConfig.y + window.innerHeight / 2) / stageConfig.scale;
+    saveSnapshot();
     setTexts(prev => [...prev, { id: Date.now().toString(), x: centerX, y: centerY - 100, text: '雙擊以編輯文字', fontSize: 24, color: '#333333' }]);
   };
 
@@ -842,12 +1004,12 @@ function App() {
           </button>
           
           <div style={{ display: 'flex', gap: '5px', alignItems: 'center', borderLeft: '2px solid #ccc', paddingLeft: '15px' }}>
-            <b>排數:</b><input type="number" value={bbRows} onChange={e => setBbRows(Number(e.target.value))} style={{width: '60px'}} />
+            <b>排數:</b><input type="number" value={bbRows} onChange={e => { saveSnapshot(); setBbRows(Number(e.target.value)); }} style={{width: '60px'}} />
           </div>
 
           <div style={{ display: 'flex', gap: '5px', alignItems: 'center', borderLeft: '2px solid #ccc', paddingLeft: '15px' }}>
             <b>條數:</b>
-            <select value={bbStrips} onChange={e => setBbStrips(Number(e.target.value))}>
+            <select value={bbStrips} onChange={e => { saveSnapshot(); setBbStrips(Number(e.target.value)); }}>
               <option value={1}>單條</option>
               <option value={2}>雙條</option>
             </select>
@@ -856,9 +1018,9 @@ function App() {
           <div style={{ display: 'flex', gap: '5px', alignItems: 'center', borderLeft: '2px solid #ccc', paddingLeft: '15px' }}>
             <b>導線:</b>
             {['#ff0000', '#000000', '#0000ff', '#00ff00', '#ffff00'].map(c => (
-              <div key={c} onClick={() => { setWireColor(c); if (selectedItems.some(s => s.type === 'wire')) setWires(prev => prev.map(w => selectedItems.some(s => s.id === w.id) ? { ...w, color: c } : w)); }} style={{ width: '20px', height: '20px', backgroundColor: c, border: wireColor === c ? '3px solid #333' : '1px solid #ccc', cursor: 'pointer', borderRadius: '50%' }} />
+              <div key={c} onClick={() => { if (selectedItems.some(s => s.type === 'wire')) saveSnapshot(); setWireColor(c); if (selectedItems.some(s => s.type === 'wire')) setWires(prev => prev.map(w => selectedItems.some(s => s.id === w.id) ? { ...w, color: c } : w)); }} style={{ width: '20px', height: '20px', backgroundColor: c, border: wireColor === c ? '3px solid #333' : '1px solid #ccc', cursor: 'pointer', borderRadius: '50%' }} />
             ))}
-            <input type="color" value={wireColor} onChange={e => { setWireColor(e.target.value); if (selectedItems.some(s => s.type === 'wire')) setWires(prev => prev.map(w => selectedItems.some(s => s.id === w.id) ? { ...w, color: e.target.value } : w)); }} style={{ width: '28px', height: '28px', padding: 0, border: 'none', background: 'transparent', cursor: 'pointer' }} title="自訂導線顏色" />
+            <input type="color" value={wireColor} onChange={e => { if (selectedItems.some(s => s.type === 'wire')) saveSnapshot(); setWireColor(e.target.value); if (selectedItems.some(s => s.type === 'wire')) setWires(prev => prev.map(w => selectedItems.some(s => s.id === w.id) ? { ...w, color: e.target.value } : w)); }} style={{ width: '28px', height: '28px', padding: 0, border: 'none', background: 'transparent', cursor: 'pointer' }} title="自訂導線顏色" />
           </div>
 
           <button onClick={addTextNode} style={{ borderLeft: '2px solid #ccc', paddingLeft: '15px', background: 'none', border: 'none', cursor: 'pointer', fontSize: '15px', color: '#0066cc', fontWeight: 'bold' }}>➕ 文字</button>
@@ -869,15 +1031,15 @@ function App() {
             <button onClick={() => addDynamicPart('led')} style={{ background: '#fff', border: '1px solid #ccc', borderRadius: '4px', cursor: 'pointer', padding: '4px 8px', fontSize: '13px' }}>💡 LED</button>
           </div>
 
-          <button onClick={() => setIsUsbConnected(!isUsbConnected)} style={{ padding: '5px 15px', background: isUsbConnected ? '#e74c3c' : '#3498db', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', marginLeft: '10px' }}>
+          <button onClick={() => { saveSnapshot(); setIsUsbConnected(!isUsbConnected); }} style={{ padding: '5px 15px', background: isUsbConnected ? '#e74c3c' : '#3498db', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', marginLeft: '10px' }}>
             {isUsbConnected ? '❌ 拔除 USB' : '🔌 插入 USB'}
           </button>
 
           {singleSelectedItem.type === 'text' ? (
             <div style={{ display: 'flex', gap: '10px', alignItems: 'center', background: '#e3f2fd', padding: '5px 10px', borderRadius: '6px', marginLeft: '10px' }}>
               <b>字體:</b>
-              <input type="color" value={editingTextColor} onChange={e => setEditingTextColor(e.target.value)} />
-              <input type="number" value={editingTextSize} onChange={e => setEditingTextSize(Number(e.target.value))} style={{width: '50px'}} />
+              <input type="color" value={editingTextColor} onChange={e => { saveSnapshot(); setEditingTextColor(e.target.value); }} />
+              <input type="number" value={editingTextSize} onChange={e => { saveSnapshot(); setEditingTextSize(Number(e.target.value)); }} style={{width: '50px'}} />
             </div>
           ) : null}
 
@@ -905,8 +1067,52 @@ function App() {
           <div style={{ color: '#888', fontSize: '14px', marginRight: '10px' }}>
             {selectedItems.length > 1 ? `已選取 ${selectedItems.length} 個物件 (Del)` : singleSelectedItem.id ? `選取中: ${singleSelectedItem.type} (Del)` : '未選取物件'}
           </div>
+          
+          <div style={{ display: 'flex', gap: '5px', marginRight: '5px' }}>
+            <button onClick={handleUndo} disabled={past.length === 0} style={{ padding: '6px 12px', background: past.length === 0 ? '#ccc' : '#7f8c8d', color: 'white', border: 'none', borderRadius: '4px', cursor: past.length === 0 ? 'not-allowed' : 'pointer', fontWeight: 'bold' }} title="上一步 (Ctrl+Z)">↶</button>
+            <button onClick={handleRedo} disabled={future.length === 0} style={{ padding: '6px 12px', background: future.length === 0 ? '#ccc' : '#7f8c8d', color: 'white', border: 'none', borderRadius: '4px', cursor: future.length === 0 ? 'not-allowed' : 'pointer', fontWeight: 'bold' }} title="下一步 (Ctrl+Y)">↷</button>
+          </div>
+
           <button onClick={handleExportImage} style={{ padding: '6px 15px', background: '#9b59b6', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>🖼️ 匯出</button>
-          <button onClick={handleLoadFromCloud} style={{ padding: '6px 15px', background: '#2196F3', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>📂 讀取</button>
+          
+          <div style={{ position: 'relative' }}>
+            <button 
+              onClick={() => setIsProjectDropdownOpen(!isProjectDropdownOpen)} 
+              style={{ padding: '6px 15px', background: '#2196F3', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}
+            >
+              📂 載入專案... ▾
+            </button>
+            {isProjectDropdownOpen && (
+              <>
+                <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 999 }} onClick={() => setIsProjectDropdownOpen(false)} />
+                <div style={{ position: 'absolute', top: '100%', left: 0, marginTop: '5px', background: 'white', border: '1px solid #ccc', borderRadius: '6px', boxShadow: '0 4px 15px rgba(0,0,0,0.2)', zIndex: 1000, width: '260px', maxHeight: '350px', overflowY: 'auto' }}>
+                  {savedProjects.length === 0 ? (
+                    <div style={{ padding: '15px', textAlign: 'center', color: '#888', fontSize: '14px' }}>無已儲存的專案</div>
+                  ) : (
+                    savedProjects.map(name => (
+                      <div 
+                        key={name} 
+                        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', borderBottom: '1px solid #eee', cursor: 'pointer', transition: 'background 0.2s' }}
+                        onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f5f5f5'}
+                        onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                        onClick={() => { setIsProjectDropdownOpen(false); handleLoadFromCloud(name); }}
+                      >
+                        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '14px', color: '#333' }} title={`載入 ${name}`}>{name}</span>
+                        <button 
+                          onClick={(e) => { e.stopPropagation(); handleDeleteProject(name); }} 
+                          style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '16px', padding: '4px', marginLeft: '8px', color: '#e74c3c', borderRadius: '4px', transition: 'background 0.2s' }}
+                          title={`刪除 ${name}`}
+                          onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#ffebee'}
+                          onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                        >❌</button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
           <button onClick={handleSaveToCloud} style={{ padding: '6px 15px', background: '#4CAF50', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>☁️ 儲存</button>
         </div>
       </div>
@@ -923,9 +1129,19 @@ function App() {
             </label>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
               {library.map(t => (
-                <div key={t.id} onClick={() => addPartToBoard(t)} style={{ border: '1px solid #ddd', padding: '10px', borderRadius: '4px', cursor: 'pointer', background: 'white', textAlign: 'center', transition: '0.2s', boxShadow: '0 2px 5px rgba(0,0,0,0.05)' }}>
-                  <img src={t.img.src} alt={t.title} style={{ maxWidth: '100%', maxHeight: '100px', objectFit: 'contain' }} />
+                <div key={t.id} style={{ border: '1px solid #ddd', padding: '10px', borderRadius: '4px', background: 'white', textAlign: 'center', transition: '0.2s', boxShadow: '0 2px 5px rgba(0,0,0,0.05)' }}>
+                  <img src={t.img.src} alt={t.title} onClick={() => addPartToBoard(t)} style={{ maxWidth: '100%', maxHeight: '100px', objectFit: 'contain', cursor: 'pointer' }} />
                   <div style={{ fontSize: '12px', marginTop: '8px', fontWeight: 'bold', color: '#333' }}>{t.title}</div>
+                  <button onClick={async () => {
+                    try {
+                      await deleteDoc(doc(db, 'components', t.id));
+                      setLibrary(prev => prev.filter(c => c.id !== t.id));
+                      alert(`✅ [${t.title}] 已刪除！`);
+                    } catch (error) {
+                      console.error('刪除失败:', error);
+                      alert('❌ 刪除失败');
+                    }
+                  }} style={{ marginTop: '8px', padding: '4px 8px', fontSize: '11px', background: '#ff6b6b', color: 'white', border: 'none', borderRadius: '3px', cursor: 'pointer' }}>刪除</button>
                 </div>
               ))}
             </div>
@@ -968,7 +1184,7 @@ function App() {
             />
           ) : null}
           <Stage 
-            ref={stageRef} width={window.innerWidth - (isSidebarOpen ? 320 : 50)} height={window.innerHeight - 150}
+            ref={stageRef} width={window.innerWidth - (isSidebarOpen ? 320 : 50)} height={window.innerHeight - 80}
             draggable={false} 
             scaleX={stageConfig.scale} scaleY={stageConfig.scale} x={stageConfig.x} y={stageConfig.y}
             onWheel={handleWheel} 
@@ -1022,7 +1238,7 @@ function App() {
                       return (
                         <Circle 
                           key={idx} x={wire.points[idx]} y={wire.points[idx + 1]} radius={6} fill="#ffffff" stroke={wire.color} strokeWidth={3} draggable
-                          onDragStart={(e) => { if (e.evt.button === 2) e.target.stopDrag(); }}
+                          onDragStart={(e) => { if (e.evt.button === 2) { e.target.stopDrag(); return; } saveSnapshot(); }}
                           onClick={e => e.cancelBubble = true} onDblClick={(e) => handleJointDblClick(e, wire.id, idx)} 
                           onDragMove={(e) => handleJointDragMove(e, wire.id, idx)} onDragEnd={(e) => handleJointDragEnd(e, wire.id, idx)}
                           onMouseEnter={(e) => e.target.getStage().container().style.cursor = 'grab'} onMouseLeave={(e) => e.target.getStage().container().style.cursor = 'pointer'}
@@ -1045,6 +1261,7 @@ function App() {
                     e.evt.preventDefault(); 
                     if (hasPanned.current) return; 
                     
+                    saveSnapshot();
                     const globalPins = getPartGlobalPins(part);
                     const connections = [];
                     wires.forEach(w => {
@@ -1131,8 +1348,8 @@ function App() {
               {texts.map(t => (
                 <Text 
                   key={t.id} x={t.x} y={t.y} text={t.text} fontSize={t.fontSize} fill={t.color} draggable shadowBlur={selectedItems.some(s => s.id === t.id) ? 10 : 0} shadowColor="blue" 
-                  onDragStart={(e) => { if (e.evt.button === 2) e.target.stopDrag(); }}
-                  onClick={(e) => handleItemClick(e, t.id, 'text')} onDblClick={(e) => { const newText = window.prompt("請輸入文字:", t.text); if (newText !== null) setTexts(prev => prev.map(item => item.id === t.id ? { ...item, text: newText } : item)); }} 
+                  onDragStart={(e) => { if (e.evt.button === 2) { e.target.stopDrag(); return; } saveSnapshot(); }}
+                  onClick={(e) => handleItemClick(e, t.id, 'text')} onDblClick={(e) => { const newText = window.prompt("請輸入文字:", t.text); if (newText !== null && newText !== t.text) { saveSnapshot(); setTexts(prev => prev.map(item => item.id === t.id ? { ...item, text: newText } : item)); } }} 
                   onDragMove={(e) => handleTextDragMove(e, t.id)} onDragEnd={(e) => handleItemDragEnd(e, t.id, 'text')} 
                   onMouseEnter={(e) => e.target.getStage().container().style.cursor = 'text'} onMouseLeave={(e) => e.target.getStage().container().style.cursor = 'default'} 
                 />
@@ -1151,13 +1368,39 @@ function App() {
                   listening={false}
                 />
               ) : null}
+
+              {/* ✅ 水印 - 固定在面包板右下角，不随缩放 */}
+              <Group
+                x={boardPos.x + bbLayout.width - 310}
+                y={boardPos.y + bbLayout.height - 35}
+                listening={false}
+              >
+                <Rect
+                  x={0}
+                  y={0}
+                  width={310}
+                  height={35}
+                  fill="rgba(128, 128, 128, 0.6)"
+                  cornerRadius={6}
+                />
+                <Text
+                  x={8}
+                  y={8}
+                  text="copyright © 2026 NCYU OFC Lab"
+                  fontSize={20}
+                  fontFamily="'Times New Roman'"
+                  fill="#FFFFFF"
+                  fontStyle="bold"
+                  width={300}
+                />
+              </Group>
             </Layer>
           </Stage>
         </div>
       </div>
       
       {/* ================= 提示小抄 ================= */}
-      <div style={{ position: 'fixed', bottom: '20px', right: '30px', zIndex: 1000, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '10px' }}>
+      <div style={{ position: 'fixed', top: '150px', right: '20px', zIndex: 1000, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '10px' }}>
         {isTipsOpen ? (
           <div style={{ background: 'rgba(255,255,255,0.95)', padding: '15px 20px', borderRadius: '8px', boxShadow: '0 4px 15px rgba(0,0,0,0.15)', fontSize: '13px', lineHeight: '1.8', border: '1px solid #ddd' }}>
             <div style={{ fontWeight: 'bold', marginBottom: '8px', color: '#2c3e50', fontSize: '14px' }}>💡 專業操作提示</div>
