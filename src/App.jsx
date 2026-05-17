@@ -107,6 +107,7 @@ function App() {
   const [isUsbConnected, setIsUsbConnected] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isTipsOpen, setIsTipsOpen] = useState(false);
+  const [isAddNodeMode, setIsAddNodeMode] = useState(false);
 
   const [lcdInput, setLcdInput] = useState({ open: false, partInstanceId: null, value: '', x: 0, y: 0 });
 
@@ -173,6 +174,10 @@ function App() {
       setTexts(prev => prev.map(t => t.id === singleSelectedItem.id ? { ...t, color: editingTextColor, fontSize: editingTextSize } : t));
     }
   }, [editingTextColor, editingTextSize]);
+
+  useEffect(() => {
+    if (singleSelectedItem.type !== 'part' && isAddNodeMode) setIsAddNodeMode(false);
+  }, [singleSelectedItem.type, isAddNodeMode]);
 
   useEffect(() => {
     const handleKeyDown = (e) => {
@@ -491,32 +496,141 @@ function App() {
       }));
 
       const svgDoc = parser.parseFromString(svgContent, "image/svg+xml"); const svgRoot = svgDoc.querySelector('svg');
-      let vbWidth = parseFloat(svgRoot.getAttribute('viewBox')?.split(/[ ,]+/)[2]) || parseFloat(svgRoot.getAttribute('width')) || 1;
-      let vbHeight = parseFloat(svgRoot.getAttribute('viewBox')?.split(/[ ,]+/)[3]) || parseFloat(svgRoot.getAttribute('height')) || 1;
+      
+      // 获取 SVG 的实际尺寸（毫米）
+      const svgWidthStr = svgRoot.getAttribute('width') || '1';
+      const svgHeightStr = svgRoot.getAttribute('height') || '1';
+      const svgWidth = parseFloat(svgWidthStr);
+      const svgHeight = parseFloat(svgHeightStr);
+      
+      // 尝试从 viewBox 获取参考尺寸
+      const viewBox = svgRoot.getAttribute('viewBox');
+      let refWidth = svgWidth, refHeight = svgHeight;
+      if (viewBox) {
+        const parts = viewBox.split(/[ ,]+/).map(p => parseFloat(p));
+        if (parts.length >= 4) {
+          refWidth = parts[2];
+          refHeight = parts[3];
+        }
+      }
 
-      const img = new window.Image(); img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svgContent)));
+      const img = new window.Image(); 
+      img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svgContent)));
+      
+      // 计算元素在 SVG 中的全局坐标（考虑变换）
+      const getElementGlobalPosition = (el) => {
+        let x = 0, y = 0;
+        const tagName = el.tagName.toLowerCase();
+
+        if (tagName === 'circle') {
+          x = parseFloat(el.getAttribute('cx') || 0);
+          y = parseFloat(el.getAttribute('cy') || 0);
+        } else if (tagName === 'rect') {
+          x = parseFloat(el.getAttribute('x') || 0) + parseFloat(el.getAttribute('width') || 0) / 2;
+          y = parseFloat(el.getAttribute('y') || 0) + parseFloat(el.getAttribute('height') || 0) / 2;
+        } else if (tagName === 'path') {
+          // 从路径的 d 属性中提取首个坐标
+          const pathD = el.getAttribute('d') || '';
+          const match = pathD.match(/[mM]\s*([-\d.]+)[,\s]+([-\d.]+)/);
+          if (match) {
+            x = parseFloat(match[1]);
+            y = parseFloat(match[2]);
+          }
+        } else {
+          x = parseFloat(el.getAttribute('cx') || el.getAttribute('x') || 0);
+          y = parseFloat(el.getAttribute('cy') || el.getAttribute('y') || 0);
+        }
+
+        // 向上遍历父元素，收集所有 transform
+        let currentEl = el;
+        const transformStack = [];
+        
+        while (currentEl && currentEl !== svgRoot) {
+          const transform = currentEl.getAttribute('transform');
+          if (transform) {
+            // 检查并跳过大的坐标调整 translate（如 translate(0, -935.xxx)）
+            const translateMatch = transform.match(/translate\s*\(\s*([-\d.]+)[\s,]+([-\d.]+)\s*\)/);
+            if (translateMatch) {
+              const tx = parseFloat(translateMatch[1]);
+              const ty = parseFloat(translateMatch[2]);
+              // 跳过那些偏移值绝对值 > 100 的（通常是 Inkscape 的坐标调整）
+              if (Math.abs(ty) > 100 && Math.abs(tx) < 1) {
+                // 这是大的垂直偏移，可能是坐标调整，跳过
+              } else {
+                transformStack.push(transform);
+              }
+            } else {
+              // 不是 translate，直接添加（可能是 matrix 等）
+              transformStack.push(transform);
+            }
+          }
+          currentEl = currentEl.parentElement;
+        }
+
+        // 应用所有变换（从外到内）
+        for (const transform of transformStack.reverse()) {
+          const translateMatch = transform.match(/translate\s*\(\s*([-\d.]+)[\s,]+([-\d.]+)\s*\)/);
+          const matrixMatch = transform.match(/matrix\s*\(\s*([-\d.]+)[\s,]+([-\d.]+)[\s,]+([-\d.]+)[\s,]+([-\d.]+)[\s,]+([-\d.]+)[\s,]+([-\d.]+)\s*\)/);
+          
+          if (translateMatch) {
+            const tx = parseFloat(translateMatch[1]);
+            const ty = parseFloat(translateMatch[2]);
+            x += tx;
+            y += ty;
+          } else if (matrixMatch) {
+            // matrix(a, b, c, d, e, f) 应用于 (x, y) 得到 (ax+cy+e, bx+dy+f)
+            const a = parseFloat(matrixMatch[1]);
+            const b = parseFloat(matrixMatch[2]);
+            const c = parseFloat(matrixMatch[3]);
+            const d = parseFloat(matrixMatch[4]);
+            const e = parseFloat(matrixMatch[5]);
+            const f = parseFloat(matrixMatch[6]);
+            
+            const newX = a * x + c * y + e;
+            const newY = b * x + d * y + f;
+            x = newX;
+            y = newY;
+          }
+        }
+
+        return { x, y };
+      };
+
       img.onload = async () => {
         const extractedPins = [];
         connectors.forEach(conn => {
           if (!conn.svgId) return; const el = svgDoc.getElementById(conn.svgId);
           if (el) {
-            let x = parseFloat(el.getAttribute('cx') || el.getAttribute('x') || 0); let y = parseFloat(el.getAttribute('cy') || el.getAttribute('y') || 0);
-            if (el.tagName.toLowerCase() === 'rect') { x += parseFloat(el.getAttribute('width') || 0) / 2; y += parseFloat(el.getAttribute('height') || 0) / 2; }
-            extractedPins.push({ id: conn.id, name: conn.name, x: x * (img.width / vbWidth) * DPI_SCALE, y: y * (img.height / vbHeight) * DPI_SCALE });
+            const pos = getElementGlobalPosition(el);
+            // SVG 坐标（毫米）直接应用 DPI_SCALE 转换为应用坐标
+            extractedPins.push({ id: conn.id, name: conn.name, x: pos.x * DPI_SCALE, y: pos.y * DPI_SCALE });
           }
         });
         
         const componentId = Date.now().toString();
-        const newComponent = { id: componentId, title, svgContent, pins: extractedPins, width: img.width * DPI_SCALE, height: img.height * DPI_SCALE };
+        // 零件尺寸也应用 DPI_SCALE
+        const componentWidth = svgWidth * DPI_SCALE;
+        const componentHeight = svgHeight * DPI_SCALE;
+        const newComponent = { id: componentId, title, svgContent, pins: extractedPins, width: componentWidth, height: componentHeight };
+        
+        // 调试日志
+        console.log(`[導入零件] ${title}`);
+        console.log(`  SVG尺寸(mm): ${svgWidth} × ${svgHeight}`);
+        console.log(`  應用尺寸(px): ${componentWidth.toFixed(2)} × ${componentHeight.toFixed(2)}`);
+        console.log(`  DPI_SCALE: ${DPI_SCALE}`);
+        console.log(`  孔位信息:`);
+        extractedPins.forEach(pin => {
+          console.log(`    ${pin.name} (${pin.id}): (${pin.x.toFixed(2)}, ${pin.y.toFixed(2)})`);
+        });
         
         // 保存到Firebase
         try {
           await setDoc(doc(db, 'components', componentId), newComponent);
           setLibrary(prev => [...prev, { ...newComponent, img }]);
-          alert(`✅ 零件 [${title}] 已上传并保存！`);
+          alert(`✅ 零件 [${title}] 已上傳並保存！`);
         } catch (error) {
-          console.error('保存失败:', error);
-          alert('❌ 保存到云端失败，但零件已在本地加载');
+          console.error('保存失敗:', error);
+          alert('❌ 保存到云端失敗，但零件已在本地加載');
           setLibrary(prev => [...prev, { ...newComponent, img }]);
         }
       };
@@ -695,6 +809,7 @@ function App() {
   const handlePinMouseLeave = (e) => { e.target.getStage().container().style.cursor = 'default'; e.target.fill(e.target.getAttr('originalFill')); e.target.radius(2.5); };
 
   const handleStartWire = (e) => {
+    if (isAddNodeMode) return;
     e.cancelBubble = true; const pos = getLocalPos(e.target);
     setDrawingWire({ startX: pos.x, startY: pos.y, endX: pos.x, endY: pos.y, color: wireColor });
   };
@@ -957,6 +1072,34 @@ function App() {
     if (type === 'wire') { const wire = wires.find(w => w.id === id); if (wire) setWireColor(wire.color); }
   };
 
+  const handleAddCustomNode = (e, part) => {
+    const groupNode = e.currentTarget;
+    if (!groupNode || !groupNode.getRelativePointerPosition) return;
+    const localPos = groupNode.getRelativePointerPosition();
+    if (!localPos) return;
+    const clampedX = Math.max(0, Math.min(part.width, localPos.x));
+    const clampedY = Math.max(0, Math.min(part.height, localPos.y));
+    saveSnapshot();
+    setBoardParts(prev => prev.map(p => {
+      if (p.instanceId !== part.instanceId) return p;
+      const newPin = {
+        id: `custom-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        x: clampedX,
+        y: clampedY,
+        isCustom: true
+      };
+      return { ...p, pins: [...(p.pins || []), newPin] };
+    }));
+  };
+
+  const handleRemoveCustomNode = (partId, pinId) => {
+    saveSnapshot();
+    setBoardParts(prev => prev.map(p => {
+      if (p.instanceId !== partId) return p;
+      return { ...p, pins: (p.pins || []).filter(pin => pin.id !== pinId) };
+    }));
+  };
+
   const addTextNode = () => {
     const centerX = (-stageConfig.x + window.innerWidth / 2) / stageConfig.scale; const centerY = (-stageConfig.y + window.innerHeight / 2) / stageConfig.scale;
     saveSnapshot();
@@ -1024,6 +1167,24 @@ function App() {
           </div>
 
           <button onClick={addTextNode} style={{ borderLeft: '2px solid #ccc', paddingLeft: '15px', background: 'none', border: 'none', cursor: 'pointer', fontSize: '15px', color: '#0066cc', fontWeight: 'bold' }}>➕ 文字</button>
+
+          <button
+            onClick={() => setIsAddNodeMode(prev => !prev)}
+            disabled={singleSelectedItem.type !== 'part'}
+            style={{
+              padding: '6px 12px',
+              marginLeft: '10px',
+              background: isAddNodeMode ? '#ff9800' : '#f2f2f2',
+              color: isAddNodeMode ? '#fff' : '#555',
+              border: '1px solid #ccc',
+              borderRadius: '4px',
+              cursor: singleSelectedItem.type === 'part' ? 'pointer' : 'not-allowed',
+              fontWeight: 'bold',
+              opacity: singleSelectedItem.type === 'part' ? 1 : 0.6
+            }}
+          >
+            {isAddNodeMode ? '✅ 結束新增節點' : '➕ 新增節點'}
+          </button>
           
           <div style={{ display: 'flex', gap: '8px', borderLeft: '2px solid #ccc', paddingLeft: '15px' }}>
             <button onClick={() => addDynamicPart('resistor')} style={{ background: '#fff', border: '1px solid #ccc', borderRadius: '4px', cursor: 'pointer', padding: '4px 8px', fontSize: '13px' }}>⚡ 電阻</button>
@@ -1253,7 +1414,14 @@ function App() {
                 <Group 
                   key={part.instanceId} x={part.x} y={part.y} rotation={part.rotation} offset={{ x: part.width / 2, y: part.height / 2 }} draggable 
                   onDragStart={(e) => handlePartDragStart(e, part.instanceId)}
-                  onClick={(e) => handleItemClick(e, part.instanceId, 'part')} 
+                  onClick={(e) => {
+                    if (isAddNodeMode && singleSelectedItem.id === part.instanceId) {
+                      e.cancelBubble = true;
+                      handleAddCustomNode(e, part);
+                      return;
+                    }
+                    handleItemClick(e, part.instanceId, 'part');
+                  }} 
                   onDblClick={(e) => openLcdEditor(part, e)}
                   
                   // 右鍵旋轉時：導線跟隨 + 優先以引腳貼齊麵包板洞位
@@ -1312,10 +1480,30 @@ function App() {
                   {renderPartGraphics(part, selectedItems.some(s => s.id === part.instanceId))}
                   
                   {part.pins.map(pin => (
+                    (() => {
+                      const isCustom = !!pin.isCustom;
+                      const showCustom = isCustom && singleSelectedItem.id === part.instanceId;
+                      return (
                     <Circle 
-                      key={pin.id} x={pin.x} y={pin.y} radius={2.5} fill="rgba(0,0,0,0)" stroke="transparent" strokeWidth={10} 
-                      onMouseEnter={handlePinMouseEnter} onMouseLeave={handlePinMouseLeave} onMouseDown={handleStartWire}   
+                      key={pin.id}
+                      x={pin.x}
+                      y={pin.y}
+                      radius={showCustom ? 3.5 : 2.5}
+                      fill={showCustom ? '#ff9800' : 'rgba(0,0,0,0)'}
+                      stroke={showCustom ? '#ffffff' : 'transparent'}
+                      strokeWidth={showCustom ? 1 : 10}
+                      hitStrokeWidth={12}
+                      onMouseEnter={handlePinMouseEnter}
+                      onMouseLeave={handlePinMouseLeave}
+                      onMouseDown={handleStartWire}
+                      onDblClick={(e) => {
+                        if (!pin.isCustom) return;
+                        e.cancelBubble = true;
+                        handleRemoveCustomNode(part.instanceId, pin.id);
+                      }}
                     />
+                      );
+                    })()
                   ))}
                 </Group>
               ))}
@@ -1400,7 +1588,7 @@ function App() {
       </div>
       
       {/* ================= 提示小抄 ================= */}
-      <div style={{ position: 'fixed', top: '150px', right: '20px', zIndex: 1000, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '10px' }}>
+      <div style={{ position: 'fixed', top: '15 0px', right: '20px', zIndex: 1000, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '10px' }}>
         {isTipsOpen ? (
           <div style={{ background: 'rgba(255,255,255,0.95)', padding: '15px 20px', borderRadius: '8px', boxShadow: '0 4px 15px rgba(0,0,0,0.15)', fontSize: '13px', lineHeight: '1.8', border: '1px solid #ddd' }}>
             <div style={{ fontWeight: 'bold', marginBottom: '8px', color: '#2c3e50', fontSize: '14px' }}>💡 專業操作提示</div>
@@ -1410,6 +1598,7 @@ function App() {
             <div>⚡ <b>雙擊導線</b>：新增彎折節點</div>
             <div>❌ <b>雙擊節點</b>：刪除該轉折點</div>
             <div>🔄 <b>右鍵點擊零件</b>：旋轉 90 度 (導線會自動跟隨)</div>
+            <div>🟧 <b>新增節點模式</b>：選取元件後按「新增節點」，點擊元件新增節點，雙擊節點可刪除</div>
           </div>
         ) : null}
         <button 
