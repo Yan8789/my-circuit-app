@@ -495,24 +495,50 @@ function App() {
         id: n.getAttribute('id'), name: n.getAttribute('name'), svgId: n.querySelector('breadboardView p')?.getAttribute('svgId') || null
       }));
 
-      const svgDoc = parser.parseFromString(svgContent, "image/svg+xml"); const svgRoot = svgDoc.querySelector('svg');
-      
-      // 获取 SVG 的实际尺寸（毫米）
-      const svgWidthStr = svgRoot.getAttribute('width') || '1';
-      const svgHeightStr = svgRoot.getAttribute('height') || '1';
-      const svgWidth = parseFloat(svgWidthStr);
-      const svgHeight = parseFloat(svgHeightStr);
-      
-      // 尝试从 viewBox 获取参考尺寸
+      const svgDoc = parser.parseFromString(svgContent, "image/svg+xml");
+      const svgRoot = svgDoc.querySelector('svg');
+
+      const parseSvgLength = (raw) => {
+        if (!raw) return { value: NaN, unit: null };
+        const match = raw.trim().match(/^([+-]?[\d.]+)\s*([a-zA-Z]+)?$/);
+        if (!match) return { value: NaN, unit: null };
+        return { value: parseFloat(match[1]), unit: match[2]?.toLowerCase() || null };
+      };
+
+      const getAppPxPerUnit = (unit) => {
+        const appPxPerMm = GRID_SIZE / 2.54;
+        switch (unit) {
+          case 'mm': return appPxPerMm;
+          case 'cm': return appPxPerMm * 10;
+          case 'in': return appPxPerMm * 25.4;
+          case 'pt': return appPxPerMm * (25.4 / 72);
+          case 'pc': return appPxPerMm * (25.4 / 6);
+          case 'px':
+          default: return DPI_SCALE;
+        }
+      };
+
+      const svgWidthInfo = parseSvgLength(svgRoot.getAttribute('width'));
+      const svgHeightInfo = parseSvgLength(svgRoot.getAttribute('height'));
       const viewBox = svgRoot.getAttribute('viewBox');
-      let refWidth = svgWidth, refHeight = svgHeight;
+      let vbWidth = NaN; let vbHeight = NaN;
       if (viewBox) {
         const parts = viewBox.split(/[ ,]+/).map(p => parseFloat(p));
         if (parts.length >= 4) {
-          refWidth = parts[2];
-          refHeight = parts[3];
+          vbWidth = parts[2];
+          vbHeight = parts[3];
         }
       }
+
+      const unit = svgWidthInfo.unit || svgHeightInfo.unit || 'px';
+      const unitToViewBox = (Number.isFinite(vbWidth) && Number.isFinite(svgWidthInfo.value))
+        ? (svgWidthInfo.value / vbWidth)
+        : (Number.isFinite(vbHeight) && Number.isFinite(svgHeightInfo.value))
+          ? (svgHeightInfo.value / vbHeight)
+          : 1;
+      const appPxPerSvgUnit = getAppPxPerUnit(unit) * unitToViewBox;
+      const baseWidthUnits = Number.isFinite(vbWidth) ? vbWidth : (Number.isFinite(svgWidthInfo.value) ? svgWidthInfo.value : 1);
+      const baseHeightUnits = Number.isFinite(vbHeight) ? vbHeight : (Number.isFinite(svgHeightInfo.value) ? svgHeightInfo.value : 1);
 
       const img = new window.Image(); 
       img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svgContent)));
@@ -602,22 +628,23 @@ function App() {
           if (!conn.svgId) return; const el = svgDoc.getElementById(conn.svgId);
           if (el) {
             const pos = getElementGlobalPosition(el);
-            // SVG 坐标（毫米）直接应用 DPI_SCALE 转换为应用坐标
-            extractedPins.push({ id: conn.id, name: conn.name, x: pos.x * DPI_SCALE, y: pos.y * DPI_SCALE });
+            // 将 SVG 坐标转换为应用坐标（处理 mm/px 等单位）
+            extractedPins.push({ id: conn.id, name: conn.name, x: pos.x * appPxPerSvgUnit, y: pos.y * appPxPerSvgUnit });
           }
         });
         
         const componentId = Date.now().toString();
-        // 零件尺寸也应用 DPI_SCALE
-        const componentWidth = svgWidth * DPI_SCALE;
-        const componentHeight = svgHeight * DPI_SCALE;
+        // 零件尺寸也应用单位转换
+        const componentWidth = baseWidthUnits * appPxPerSvgUnit;
+        const componentHeight = baseHeightUnits * appPxPerSvgUnit;
         const newComponent = { id: componentId, title, svgContent, pins: extractedPins, width: componentWidth, height: componentHeight };
         
         // 调试日志
         console.log(`[導入零件] ${title}`);
-        console.log(`  SVG尺寸(mm): ${svgWidth} × ${svgHeight}`);
+        console.log(`  SVG尺寸: ${svgWidthInfo.value || baseWidthUnits} × ${svgHeightInfo.value || baseHeightUnits} (${unit})`);
+        if (Number.isFinite(vbWidth) && Number.isFinite(vbHeight)) console.log(`  viewBox: ${vbWidth} × ${vbHeight}`);
         console.log(`  應用尺寸(px): ${componentWidth.toFixed(2)} × ${componentHeight.toFixed(2)}`);
-        console.log(`  DPI_SCALE: ${DPI_SCALE}`);
+        console.log(`  DPI_SCALE: ${DPI_SCALE} / appPxPerSvgUnit: ${appPxPerSvgUnit.toFixed(4)}`);
         console.log(`  孔位信息:`);
         extractedPins.forEach(pin => {
           console.log(`    ${pin.name} (${pin.id}): (${pin.x.toFixed(2)}, ${pin.y.toFixed(2)})`);
