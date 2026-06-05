@@ -101,6 +101,7 @@ function App() {
   const [stageConfig, setStageConfig] = useState({ scale: 1, x: 0, y: 0 });
   const [bbRows, setBbRows] = useState(30); 
   const [bbStrips, setBbStrips] = useState(1);
+  const [bbSecondGreyCols, setBbSecondGreyCols] = useState(5);
   const [boardPos, setBoardPos] = useState({ x: GRID_SIZE * 4, y: GRID_SIZE * 4 });
   const [wireColor, setWireColor] = useState('#ff0000'); 
   const [drawingWire, setDrawingWire] = useState(null); 
@@ -135,10 +136,10 @@ function App() {
   const [past, setPast] = useState([]);
   const [future, setFuture] = useState([]);
 
-  const currentStateRef = useRef({ boardParts, wires, texts, bbRows, bbStrips, boardPos, isUsbConnected });
+  const currentStateRef = useRef({ boardParts, wires, texts, bbRows, bbStrips, bbSecondGreyCols, boardPos, isUsbConnected });
   useEffect(() => {
-    currentStateRef.current = { boardParts, wires, texts, bbRows, bbStrips, boardPos, isUsbConnected };
-  }, [boardParts, wires, texts, bbRows, bbStrips, boardPos, isUsbConnected]);
+    currentStateRef.current = { boardParts, wires, texts, bbRows, bbStrips, bbSecondGreyCols, boardPos, isUsbConnected };
+  }, [boardParts, wires, texts, bbRows, bbStrips, bbSecondGreyCols, boardPos, isUsbConnected]);
 
   const saveSnapshot = () => {
     const currentState = currentStateRef.current;
@@ -156,7 +157,9 @@ function App() {
     setFuture(prev => [currentStateRef.current, ...prev]);
     
     setBoardParts(previousState.boardParts); setWires(previousState.wires); setTexts(previousState.texts);
-    setBbRows(previousState.bbRows); setBbStrips(previousState.bbStrips); setBoardPos(previousState.boardPos); setIsUsbConnected(previousState.isUsbConnected);
+    setBbRows(previousState.bbRows); setBbStrips(previousState.bbStrips);
+    setBbSecondGreyCols(previousState.bbSecondGreyCols ?? 5);
+    setBoardPos(previousState.boardPos); setIsUsbConnected(previousState.isUsbConnected);
   }, [past]);
 
   const handleRedo = useCallback(() => {
@@ -166,7 +169,9 @@ function App() {
     setPast(prev => [...prev, currentStateRef.current]);
     
     setBoardParts(nextState.boardParts); setWires(nextState.wires); setTexts(nextState.texts);
-    setBbRows(nextState.bbRows); setBbStrips(nextState.bbStrips); setBoardPos(nextState.boardPos); setIsUsbConnected(nextState.isUsbConnected);
+    setBbRows(nextState.bbRows); setBbStrips(nextState.bbStrips);
+    setBbSecondGreyCols(nextState.bbSecondGreyCols ?? 5);
+    setBoardPos(nextState.boardPos); setIsUsbConnected(nextState.isUsbConnected);
   }, [future]);
 
   useEffect(() => {
@@ -247,7 +252,7 @@ function App() {
     const projectData = {
       library: library.map(({ img, ...rest }) => rest), 
       boardParts: boardParts.map(({ img, ...rest }) => rest),
-      wires, texts, bbRows, bbStrips, boardPos, isUsbConnected,
+      wires, texts, bbRows, bbStrips, bbSecondGreyCols, boardPos, isUsbConnected,
       savedAt: new Date().toISOString()
     };
     try {
@@ -312,7 +317,9 @@ function App() {
           return { ...part, id: mappedId, img: libItem ? libItem.img : null };
         }));
         setBoardParts(rebuiltParts); setWires(data.wires || []); setTexts(data.texts || []);
-        setBbRows(data.bbRows || 30); setBbStrips(data.bbStrips || 1); setBoardPos(data.boardPos || { x: GRID_SIZE * 4, y: GRID_SIZE * 4 });
+        setBbRows(data.bbRows || 30); setBbStrips(data.bbStrips || 1);
+        setBbSecondGreyCols(data.bbSecondGreyCols ?? 5);
+        setBoardPos(data.boardPos || { x: GRID_SIZE * 4, y: GRID_SIZE * 4 });
         setIsUsbConnected(data.isUsbConnected || false); setSelectedItems([]);
         setSelectedProjectName(projectName);
         alert(`✅ 成功載入！`);
@@ -1135,28 +1142,46 @@ function App() {
 
   const generateBreadboard = () => {
     const holes = [];
-    const segmentWidth = 24 * GRID_SIZE;
     const segmentHeight = (bbRows + 2) * GRID_SIZE;
     const segmentGap = 2 * GRID_SIZE;
     const segmentLefts = [];
+    const segmentWidths = [];
+
+    const baseGapCols = 5;
+    const getGapColsForSegment = (segmentIndex) => {
+      if (segmentIndex === 1) return bbSecondGreyCols;
+      return baseGapCols;
+    };
+
+    let totalWidth = 0;
 
     for (let s = 0; s < bbStrips; s++) {
-      const xOffset = s * (segmentWidth + segmentGap);
+      const gapCols = getGapColsForSegment(s);
+      const segmentWidth = (19 + gapCols) * GRID_SIZE;
+      const rightTerminalStart = 10.5 + gapCols;
+      const rightPowerBlue = 16.5 + gapCols;
+      const rightPowerRed = 17.5 + gapCols;
+
+      const xOffset = totalWidth;
       segmentLefts.push(xOffset);
+      segmentWidths.push(segmentWidth);
       for (let row = 0; row < bbRows; row++) {
         const y = (row + 1) * GRID_SIZE;
         holes.push({ x: xOffset + 1.5 * GRID_SIZE, y, type: 'power', color: '#ff4444' });
         holes.push({ x: xOffset + 2.5 * GRID_SIZE, y, type: 'power', color: '#4444ff' });
         for (let c = 4.5; c <= 8.5; c++) holes.push({ x: xOffset + c * GRID_SIZE, y, type: 'terminal', color: '#555' });
-        for (let c = 15.5; c <= 19.5; c++) holes.push({ x: xOffset + c * GRID_SIZE, y, type: 'terminal', color: '#555' });
-        holes.push({ x: xOffset + 21.5 * GRID_SIZE, y, type: 'power', color: '#4444ff' });
-        holes.push({ x: xOffset + 22.5 * GRID_SIZE, y, type: 'power', color: '#ff4444' });
+        for (let i = 0; i < 5; i++) holes.push({ x: xOffset + (rightTerminalStart + i) * GRID_SIZE, y, type: 'terminal', color: '#555' });
+        holes.push({ x: xOffset + rightPowerBlue * GRID_SIZE, y, type: 'power', color: '#4444ff' });
+        holes.push({ x: xOffset + rightPowerRed * GRID_SIZE, y, type: 'power', color: '#ff4444' });
       }
+
+      totalWidth += segmentWidth;
+      if (s < bbStrips - 1) totalWidth += segmentGap;
     }
 
-    const width = bbStrips * segmentWidth + (bbStrips - 1) * segmentGap;
+    const width = totalWidth;
     const height = segmentHeight;
-    return { width, height, holes, segmentLefts, segmentHeight, segmentWidth };
+    return { width, height, holes, segmentLefts, segmentWidths, segmentHeight };
   };
   const bbLayout = generateBreadboard();
 
@@ -1184,6 +1209,26 @@ function App() {
               <option value={2}>雙條</option>
             </select>
           </div>
+
+          {bbStrips === 2 ? (
+            <div style={{ display: 'flex', gap: '5px', alignItems: 'center' }}>
+              <b>第二條灰色(格):</b>
+              <input
+                type="number"
+                min={1}
+                max={7}
+                step={1}
+                value={bbSecondGreyCols}
+                onChange={e => {
+                  const raw = Number(e.target.value);
+                  const next = Number.isFinite(raw) ? Math.max(1, Math.min(7, raw)) : 5;
+                  saveSnapshot();
+                  setBbSecondGreyCols(next);
+                }}
+                style={{ width: '70px' }}
+              />
+            </div>
+          ) : null}
 
           <div style={{ display: 'flex', gap: '5px', alignItems: 'center', borderLeft: '2px solid #ccc', paddingLeft: '15px' }}>
             <b>導線:</b>
@@ -1390,15 +1435,32 @@ function App() {
                 <Rect width={bbLayout.width} height={bbLayout.height} fill="#ffffff" cornerRadius={6} shadowBlur={selectedItems.some(s => s.id === 'breadboard') ? 15 : 5} shadowColor={selectedItems.some(s => s.id === 'breadboard') ? 'blue' : 'black'} />
                 {bbLayout.segmentLefts.map((left, segIdx) => (
                   <Group key={`bb-seg-${segIdx}`} listening={false}>
-                    <Rect x={left + 9.5 * GRID_SIZE} y={0} width={5 * GRID_SIZE} height={bbLayout.segmentHeight} fill="#f0f0f0" />
+                    {(() => {
+                      const gapCols = (segIdx === 1 ? bbSecondGreyCols : 5);
+                      const rightLetterStart = 10.5 + gapCols;
+                      const rightRowLabelX = 15.2 + gapCols;
+                      const rightRailBlueX = 16 + gapCols;
+                      const rightRailRedX = 18 + gapCols;
+                      return (
+                        <>
+                    <Rect
+                      x={left + 9.5 * GRID_SIZE}
+                      y={0}
+                      width={gapCols * GRID_SIZE}
+                      height={bbLayout.segmentHeight}
+                      fill="#f0f0f0"
+                    />
                     {['a','b','c','d','e'].map((letter, i) => <Text key={`${segIdx}-${letter}`} x={left + (i+4.5)*GRID_SIZE - 4} y={6} text={letter} fontSize={10} fill="#888" fontStyle="bold" />)}
-                    {['f','g','h','i','j'].map((letter, i) => <Text key={`${segIdx}-r-${letter}`} x={left + (i+15.5)*GRID_SIZE - 4} y={6} text={letter} fontSize={10} fill="#888" fontStyle="bold" />)}
+                    {['f','g','h','i','j'].map((letter, i) => <Text key={`${segIdx}-r-${letter}`} x={left + (i + rightLetterStart) * GRID_SIZE - 4} y={6} text={letter} fontSize={10} fill="#888" fontStyle="bold" />)}
                     {Array.from({length: bbRows}).map((_, i) => <Text key={`row-${segIdx}-${i}`} x={left + 3.2 * GRID_SIZE} y={(i+1)*GRID_SIZE - 5} text={i+1} fontSize={10} fill="#888" />)}
-                    {Array.from({length: bbRows}).map((_, i) => <Text key={`row2-${segIdx}-${i}`} x={left + 20.2 * GRID_SIZE} y={(i+1)*GRID_SIZE - 5} text={i+1} fontSize={10} fill="#888" />)}
+                    {Array.from({length: bbRows}).map((_, i) => <Text key={`row2-${segIdx}-${i}`} x={left + rightRowLabelX * GRID_SIZE} y={(i+1)*GRID_SIZE - 5} text={i+1} fontSize={10} fill="#888" />)}
                     <Line points={[left + 1 * GRID_SIZE, GRID_SIZE, left + 1 * GRID_SIZE, bbLayout.segmentHeight - GRID_SIZE]} stroke="red" strokeWidth={2} opacity={0.5} />
                     <Line points={[left + 3 * GRID_SIZE, GRID_SIZE, left + 3 * GRID_SIZE, bbLayout.segmentHeight - GRID_SIZE]} stroke="blue" strokeWidth={2} opacity={0.5} />
-                    <Line points={[left + 21 * GRID_SIZE, GRID_SIZE, left + 21 * GRID_SIZE, bbLayout.segmentHeight - GRID_SIZE]} stroke="blue" strokeWidth={2} opacity={0.5} />
-                    <Line points={[left + 23 * GRID_SIZE, GRID_SIZE, left + 23 * GRID_SIZE, bbLayout.segmentHeight - GRID_SIZE]} stroke="red" strokeWidth={2} opacity={0.5} />
+                    <Line points={[left + rightRailBlueX * GRID_SIZE, GRID_SIZE, left + rightRailBlueX * GRID_SIZE, bbLayout.segmentHeight - GRID_SIZE]} stroke="blue" strokeWidth={2} opacity={0.5} />
+                    <Line points={[left + rightRailRedX * GRID_SIZE, GRID_SIZE, left + rightRailRedX * GRID_SIZE, bbLayout.segmentHeight - GRID_SIZE]} stroke="red" strokeWidth={2} opacity={0.5} />
+                        </>
+                      );
+                    })()}
                   </Group>
                 ))}
                 
